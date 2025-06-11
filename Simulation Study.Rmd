@@ -1,5 +1,5 @@
 ---
-title: 'Causal Discovery Under Incomplete Data — A Simulation Study of Common Algorithms'
+title: 'Causal Discovery Under Missing Data — A Simulation Study of Common Algorithms'
 output: html_document
 date: "2025-05-17"
 ---
