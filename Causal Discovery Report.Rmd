@@ -1,0 +1,635 @@
+---
+title: 'Causal Discovery Under Incomplete Data — A Simulation Study of Common Algorithms'
+output: html_document
+date: "2025-05-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r loading_libraries, echo=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+
+library(bnlearn)
+library(pcalg)
+library(causalDisco)
+
+library(igraph)
+library(ggraph)
+library(Rgraphviz)
+
+library(MASS)
+```
+
+
+
+# 3.1 Generating Synthetic Data
+
+
+```{r}
+# Function to generate a random DAG
+
+# p — number of nodes in the DAG
+# EN — expected neighborhood size (i.e., average number of parents per node)
+generateDAG <- function(p, EN){
+  edges <- rbinom(n = choose(p, 2), size = 1, prob = EN / (p-1))
+  
+  A <- matrix(0, nrow = p, ncol = p)
+  A[upper.tri(A)] <- edges
+  
+  edge_weights <- runif(sum(edges), min = 0.1, max = 1)
+  A[A == 1] <- edge_weights
+  
+  colnames(A) <- rownames(A) <- paste0('X', 1:p)
+  
+  return(A)
+}
+```
+
+
+
+```{r}
+# Function to plot a DAG from an adjacency matrix and save it as an image
+
+# amat — weighted adjacency matrix of the DAG
+# filename — name of the file to save the plot
+plotDAG <- function(amat, filename="dag_plot.png") {
+  # Convert the adjacency matrix to a bn object
+  amat[amat != 0] <- 1
+  dag <- empty.graph(nodes = colnames(amat))
+  amat(dag) <- amat
+  
+  # Plot the DAG
+  graphviz.plot(dag, shape = 'rectangle')
+  
+  # Save the DAG plot
+  png(filename, width=1000, height=600, res=300)
+  graphviz.plot(dag, shape = "rectangle")
+  invisible(dev.off())
+}
+```
+
+
+
+```{r}
+# Function to sample multivariate normal data from a DAG
+
+# N — number of samples
+# amat — weighted adjacency matrix of the DAG
+sampleDAG <- function(N, amat) {
+  amat <- t(amat)
+  p <- ncol(amat)
+  mu <- rep(0, p)
+  # mu <- rnorm(p, mean=0, sd=2)
+  
+  I <- diag(p)
+  # Add small value (1e-6 * I) for numerical stability
+  Sigma <- solve(I - amat +  1e-6*diag(p)) %*% t(solve(I - amat + 1e-6*diag(p)))
+  
+  # Sample N observations from multivariate normal distribution with mean mu and covariance Sigma
+  samples <- mvrnorm(n = N, mu = mu, Sigma = Sigma)
+  return(samples)
+}
+```
+
+
+
+# 3.2 Introducing Missingness
+
+## MCAR
+```{r}
+# Function to make data MCAR (Missing Completely At Random)
+
+# data — data frame
+# perc_miss — proportion of variables to have missing values (between 0 and 0.5)
+# prob_miss — probability that an observation in a chosen variable is missing (between 0 and 0.5)
+addMCAR <- function(data, perc_miss, prob_miss) {
+  p <- ncol(data)
+  n <- nrow(data)
+  # Randomly select variables to have missing data
+  missing_vars <- sample(colnames(data), size=ceiling(p * perc_miss))
+  
+  # For each selected variable, randomly assign missing values based on prob_miss
+  for (var in missing_vars) {
+    missing_obs <- runif(n) < prob_miss
+    data[missing_obs, var] <- NA
+  }
+  return(data)
+}
+```
+
+
+
+## MAR
+```{r}
+# Function to make data MAR (Missing At Random)
+
+# data — data frame
+# perc_miss — proportion of variables to have missing values (between 0 and 0.5)
+# prob_miss — probability that an observation in a chosen variable is missing (between 0 and 0.5)
+addMAR <- function(data, perc_miss, prob_miss) {
+  p <- ncol(data)
+  n <- nrow(data)
+  # Randomly select variables to have missing data
+  missing_vars <- sample(colnames(data), size=ceiling(p * perc_miss))
+  obs_vars <- setdiff(colnames(data), missing_vars)
+    
+  for (var in missing_vars) {
+    # Randomly select a parent variable of that affects missingness
+    parent_var <- sample(obs_vars, size = 1)
+    parent_values <- data[[parent_var]]
+     # Calculate missingness probability based on parent variable values using normal CDF
+    prob <- pnorm(parent_values, mean = mean(parent_values), sd = sd(parent_values))
+    prob <- prob/mean(prob) * prob_miss
+    prob <- pmin(prob, 1)
+    # prob <- (parent_values - min(parent_values)) / (max(parent_values) - min(parent_values))
+    # prob <- prob/mean(prob) * prob_miss
+    
+    # For each selected variable, randomly assign missing values based on prob
+    missing_indices <- runif(n) < prob
+    data[missing_indices, var] <- NA
+  }
+  return(data)
+}
+```
+
+
+
+## MNAR
+```{r}
+# Function to make data MNAR (Missing Not At Random)
+
+# data — data frame
+# perc_miss — proportion of variables to have missing values (between 0 and 0.5)
+# prob_miss — probability that an observation in a chosen variable is missing (between 0 and 0.5)
+addMNAR <- function(data, perc_miss, prob_miss) {
+  p <- ncol(data)
+  n <- nrow(data)
+  # Randomly select variables to have missing data
+  missing_vars <- sample(colnames(data), size=ceiling(p * perc_miss))
+  obs_vars <- setdiff(colnames(data), missing_vars)
+  # Split missing_vars into MAR and MNAR subsets (~50% each)
+  q <- length(missing_vars)
+  missing_vars_mnar <- sample(missing_vars, size=ceiling(q * 0.5))
+  missing_vars_mar <- setdiff(missing_vars, missing_vars_mnar)
+  
+  data_na <- data
+  # MAR missingness: depends on observed variables
+  for (var in missing_vars_mar) {
+    parent_var <- sample(obs_vars, size = 1)
+    parent_values <- data[[parent_var]]
+    
+    prob <- pnorm(parent_values, mean = mean(parent_values), sd = sd(parent_values))
+    prob <- prob/mean(prob) * prob_miss
+    prob <- pmin(prob, 1)
+    
+    # prob <- (parent_values - min(parent_values)) / (max(parent_values) - min(parent_values))
+    # prob <- prob/mean(prob) * prob_miss
+  
+    missing_indices <- runif(n) < prob
+    data_na[missing_indices, var] <- NA
+  }
+  
+  # MNAR missingness: depends on missing variables themselves
+  for (var in missing_vars_mnar) {
+    parent_var <- sample(missing_vars, size = 1)
+    parent_values <- data[[parent_var]]
+    
+    prob <- pnorm(parent_values, mean = mean(parent_values), sd = sd(parent_values))
+    prob <- prob/mean(prob) * prob_miss
+    prob <- pmin(prob, 1)
+    
+    # prob <- (parent_values - min(parent_values)) / (max(parent_values) - min(parent_values))
+    # prob <- prob/mean(prob) * prob_miss
+
+    missing_indices <- runif(n) < prob
+    data_na[missing_indices, var] <- NA
+  }
+  return(data_na)
+  
+}
+```
+
+
+```{r}
+# Sanity check for missingness functions
+# r = number samples
+# Run over 1000 iterations to check average amount of missingness produced
+
+# r = 100
+# mcar_miss <- numeric(r)
+# mar_miss <- numeric(r)
+# mnar_miss <- numeric(r)
+# 
+# for (i in 1:1e3) {
+#   DAG <- generateDAG(p = 20, EN = 2)
+#   dat <- data.frame(sampleDAG(r, DAG))
+# 
+#   data_mcar <- addMCAR(dat, perc_miss = 0.5, prob_miss = 0.2)
+#   mcar_miss[i] <- sum(is.na(data_mcar))
+# 
+#   data_mar <- addMAR(dat, perc_miss = 0.5, prob_miss = 0.2)
+#   mar_miss[i] <- sum(is.na(data_mar))
+# 
+#   data_mnar <- addMNAR(dat, perc_miss = 0.5, prob_miss = 0.2)
+#   mnar_miss[i] <- sum(is.na(data_mnar))
+# }
+# # Report average number of missing values for each missingness type
+# # Should be roughly r*p*0.5*0.2
+# mean(mcar_miss)
+# mean(mar_miss)
+# mean(mnar_miss)
+```
+
+
+
+# 3.3 Evaluation
+
+```{r}
+# Function to evaluate the accuracy of a learned DAG against the true DAG
+
+# true_amat — true weighted adjacency matrix
+# est_amat — estimated weighted adjacency matrix
+evaluateDAG <- function(true_amat, est_amat) {
+  # Convert the adjacency matrices to a binary adjacency matrices
+  true_amat[true_amat != 0] <- 1
+  est_amat[est_amat != 0] <- 1
+  # Flatten matrices into vectors for comparison
+  true_edges <- as.vector(true_amat)
+  est_edges  <- as.vector(est_amat)
+  # True Positives, False Positives, False Negatives
+  TP <- sum(true_edges == 1 & est_edges == 1)
+  FP <- sum(true_edges == 0 & est_edges == 1)
+  FN <- sum(true_edges == 1 & est_edges == 0)
+  # Compute precision, recall, F1 score
+  precision <- ifelse(TP + FP == 0, 0, TP / (TP + FP))
+  recall <- ifelse((TP + FN) == 0, 0, TP / (TP + FN))
+  f1 <- ifelse((precision + recall) == 0, 0, 2 * precision * recall / (precision + recall))
+  # Compute Structural Hamming Distance (normalized)
+  shd <- shd(true_amat, est_amat) / sum(true_amat)
+  
+  return(data.frame(precision = precision, recall = recall, f1 = f1, shd = shd))
+}
+```
+
+
+
+```{r}
+# Function to plot evaluation results
+
+# results_df — results data frame
+# filename — name of the file to save the plot
+# x_axis — variable for x-axis ("sample_size" or "perc_missing")
+plot_results <- function(results_df, filename = "evaluation_plot.png", x_axis = "sample_size") {
+  # Define custom color palette
+  all_colors <- brewer.pal(12, "Set3")
+  custom_colors <- all_colors[-2]
+  
+  # Ensure factors are properly ordered
+  results_df$missingness <- factor(results_df$missingness, levels = c("oracle", "MCAR", "MAR", "MNAR"))
+  results_df$algorithm <- factor(results_df$algorithm, levels = unique(results_df$algorithm))
+  results_df$n_factor <- factor(results_df$n, levels = sort(unique(results_df$n)))
+  results_df$perc_factor <- factor(paste0(results_df$perc_missing * 100, "%"),
+                                   levels = paste0(sort(unique(results_df$perc_missing)) * 100, "%")
+                                   )
+  # Define x-axis variable
+  if (x_axis == "sample_size") {
+    x_var <- "n_factor"
+    x_label <- "Sample Size"
+  } else if (x_axis == "perc_missing") {
+    x_var <- "perc_factor"
+    x_label <- "Missing Data"
+  } else {
+    stop("x_axis must be either 'sample_size' or 'perc_missing'")
+  }
+  # Define shape palette based on number of algorithms
+  n_algorithms <- length(levels(results_df$algorithm))
+  custom_shapes <- c(0, 1, 2, 3, 4, 5, 6, 7, 8, 9)[1:n_algorithms]
+  
+  # Reshape data to long format for ggplot
+  plot_data <- results_df %>%
+  pivot_longer(cols = c(f1, shd), names_to = "metric", values_to = "value") %>%
+  mutate(metric = factor(metric, levels = c("f1", "shd"), labels = c("F1", "SHD")))
+  
+  # Generate the plot
+  p <- ggplot(plot_data, aes_string(x = x_var, y = "value",
+                                    color = "algorithm",
+                                    shape = "algorithm",
+                                    group = "algorithm")) +
+  geom_line() +
+  geom_point(size = 2, na.rm=TRUE) +
+  facet_grid(rows = vars(metric), cols = vars(missingness), scales = "free_y", switch = "y") +
+  scale_color_manual(values = custom_colors) + 
+  scale_shape_manual(values = custom_shapes) +
+  labs(x = x_label,y = NULL, color = "Algorithm") +
+  guides(
+    color = guide_legend(override.aes = list(shape = custom_shapes, size = 2)),
+    shape = "none"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    strip.placement = "outside",
+    strip.background = element_blank(),
+    axis.title.y.left = element_text(angle = 0, vjust = 0.5),
+    strip.text.y.left = element_text(angle = 90),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = 11),
+    axis.title = element_text(size = 11),
+    legend.title = element_text(size = 11)
+  )
+  
+  print(p)
+  ggsave(filename, plot = p, width = 7, height = 3.5, dpi = 400)
+}
+```
+
+
+
+```{r}
+# Function to plot computation time
+
+# results_df — results data frame
+# filename — name of the file to save the plot
+plot_time <- function(results_df, filename = "time_plot.png") {
+  # Define custom color palette
+  all_colors <- brewer.pal(12, "Set3")
+  custom_colors <- all_colors[-2]
+  
+  # Ensure factors are properly ordered
+  results_df$missingness <- factor(results_df$missingness, levels = c("oracle", "MCAR", "MAR", "MNAR"))
+  results_df$algorithm <- factor(results_df$algorithm, levels = unique(results_df$algorithm))
+  results_df$n_factor <- factor(results_df$n, levels = sort(unique(results_df$n)))
+  
+  # Define shape palette based on number of algorithms
+  n_algorithms <- length(levels(results_df$algorithm))
+  custom_shapes <- c(0, 1, 2, 3, 4, 5, 6, 7, 8, 9)[1:n_algorithms]
+  
+  # Generate the plot
+  p <- ggplot(results_df, aes(x = n_factor, y = time,
+                              color = algorithm,
+                              shape = algorithm,
+                              group = algorithm)) +
+    geom_line() +
+    geom_point(size = 2, na.rm = TRUE) +
+    facet_grid(. ~ missingness, scales = "free_y") +
+    scale_color_manual(values = custom_colors) + 
+    scale_shape_manual(values = custom_shapes) +
+    scale_y_log10() +
+    labs(x = "Sample Size", y = "Time (seconds)", color = "Algorithm") +
+    guides(
+      color = guide_legend(override.aes = list(shape = custom_shapes, size = 2)),
+      shape = "none"
+    ) +
+    theme_bw() +
+    theme(
+      legend.position = "right",
+      legend.margin = margin(t = 35, b = 5),
+      strip.background = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      strip.text = element_text(size = 11),
+      axis.title = element_text(size = 11),
+      legend.title = element_text(size = 11)
+    )
+  
+  print(p)
+  ggsave(filename, plot = p, width = 7, height = 2.3, dpi = 400)
+}
+```
+
+
+
+```{r}
+plot(0:25, rep(1, 26), pch=0:25, cex=2)
+text(0:25, rep(1, 26)+0.1, labels=0:25, cex=0.8)
+```
+
+
+
+## Simulation
+
+```{r}
+# Function to extract the adjacency matrix from a fitted model
+
+# fit — a fitted object from a structure learning algorithm (e.g., bnlearn or pcalg)
+get_amat <- function(fit) {
+  if (inherits(fit, "bn")) {
+    # For bnlearn objects
+    return(amat(fit))
+    
+  } else if ("amat" %in% slotNames(fit)) {
+    # For pcalg objects with 'amat' (e.g., PC, FCI)
+    return(fit@amat)
+    
+  } else if ("essgraph" %in% names(fit)) {
+    # For GES/FGES fits with essential graph output
+    return(as(fit$essgraph, "matrix"))
+    
+  } else if ("graph" %in% slotNames(fit)) {
+    # Fallback for pcalg objects with 'graph'
+    return(as(fit@graph, "matrix"))
+    
+  } else {
+    stop("Unsupported object type for extracting adjacency matrix.")
+  }
+}
+```
+
+
+```{r}
+# Function to run simulation study comparing causal structure learning algorithms under missingness
+
+# ndags — number of random DAGs to generate for each setting
+# sample_sizes — vector of sample sizes to test
+# p — number of nodes in the DAG
+# EN — expected neighborhood size (i.e., average number of parents per node)
+# perc_missing — vector of proportions of variables that will have missing values
+# prob_missing — probability that an observation in a selected variable is missing
+# algorithms — vector of algorithm names to evaluate (e.g., "HC", "PC", "GES")
+# mechanisms — types of missingness mechanisms to simulate: "oracle", "MCAR", "MAR", "MNAR"
+run_simulation <- function(ndags,
+                           sample_sizes, p, EN,
+                           perc_missing,
+                           prob_missing,
+                           algorithms,
+                           mechanisms = c("oracle", "MCAR", "MAR", "MNAR")) {
+  
+  results_df <- data.frame()
+  
+  for (perc in perc_missing) {
+    cat("Percentage Missing:", perc, "\n")
+
+    for (n in sample_sizes) {
+      cat("Sample size:", n, "\n")
+      
+      for (r in 1:ndags) {
+        
+        if (r %% 5 == 0) {
+          cat("Run:", r, "\n")
+          }
+        
+        # 1. Generate random DAG and sample data
+        set.seed(798 + r)
+        true_amat <- generateDAG(p = p, EN = EN)
+        data <- data.frame(sampleDAG(n, true_amat))
+        
+        for (m in mechanisms) {
+          
+          # 2. Add missingness
+          data_miss <- switch(m,
+                              "oracle" = data,
+                              "MCAR"   = addMCAR(data, perc, prob_missing),
+                              "MAR"    = addMAR(data, perc, prob_missing),
+                              "MNAR"   = addMNAR(data, perc, prob_missing))
+          
+          for (a in algorithms) {
+            # cat("Algorithm:", a, "\n")
+            
+             # Prepare correlation matrix and sufficient statistics
+            C_pairwise <- cor(data_miss, use = "pairwise.complete.obs")
+            suffStat <- list(C = C_pairwise, n = nrow(data_miss))
+            data_listwise <- na.omit(data_miss)
+            
+            # 3. Fit algorithms
+            start <- proc.time()
+            fit <- switch(a,
+                          # Score-based algorithms
+                          "HC"    = hc(data_miss),# default is BIC
+                          "Tabu"  = tabu(data_miss),
+                          "GES"   = {
+                            if (nrow(data_listwise) > 2) {
+                              ges(new("GaussL0penObsScore", data = data_listwise))
+                            } else {
+                              warning(paste("Skipping GES: too few complete rows (", nrow(data_listwise), ")"))
+                              NULL
+                            }
+                          },
+                          "EM"    = structural.em(data_miss),
+                          # Constraint-based algorithms
+                          "PC"    = pc(suffStat,
+                                       indepTest = gaussCItest,
+                                       alpha = 0.05,
+                                       labels = colnames(data_miss)),
+                          "GS"    = gs(data_miss, test='zf'),
+                          "FCI"   = fci(suffStat,
+                                        indepTest = gaussCItest,
+                                        alpha = 0.05,
+                                        labels = colnames(data_miss)),
+                          # Hybrid algorithms
+                          "MMHC"  = mmhc(data_miss),
+                          "H2PC"  = h2pc(data_miss),
+                          "RSMAX2"= rsmax2(data_miss, restrict="pc.stable", maximize="hc")
+                          )
+            end <- proc.time()
+            diff <- end - start
+            
+            # If fit failed, store NA row
+            if (is.null(fit)) {
+              eval <- data.frame(precision = NA, recall = NA, f1 = NA, shd = NA)
+              results_df <- rbind(results_df, data.frame(n = n,
+                                                         algorithm = a,
+                                                         missingness = m,
+                                                         time = diff["elapsed"],
+                                                         perc_missing = perc,
+                                                         eval))
+              next
+            }
+            
+            
+            # 4. Evaluate estimated DAG
+            est_amat <- get_amat(fit)
+            eval <- evaluateDAG(dag2cpdag(true_amat), dag2cpdag(est_amat))
+            
+            # 5. Save results
+            results_df <- rbind(results_df, data.frame(n=n,
+                                                       algorithm=a,
+                                                       missingness=m,
+                                                       time=diff["elapsed"],
+                                                       perc_missing=perc,
+                                                       as.data.frame(eval)
+                                                       ))
+            
+            }
+          }
+        }
+      }
+    }
+    # 6. Aggregate metrics
+    means <- results_df %>%
+      group_by(n, algorithm, missingness, perc_missing) %>%
+      summarise(across(where(is.numeric), mean), .groups = "drop")
+    
+    sds <- results_df %>%
+      group_by(n, algorithm, missingness, perc_missing) %>%
+      summarise(across(where(is.numeric), sd, .names = "{.col}_sd"), .groups = "drop")
+    
+    avg_results_df <- left_join(means, sds, by = c("n", "algorithm", "missingness", "perc_missing"))
+    
+    return(avg_results_df)
+  }
+```
+
+
+
+
+# 3.4 Results
+```{r}
+# algorithms = c('HC', 'EM', 'GES', 'PC', 'GS', 'FCI', 'MMHC', 'RSMAX2'),
+# sample_sizes = c(100, 500, 1000, 5000, 10000),
+# perc_missing = c(0.1, 0.2, 0.3, 0.4, 0.5),
+# file = "10ndags_20p_2EN_03perc_04prob.csv",
+
+start <- proc.time()
+# Run the simulation study
+sim_data <- run_simulation(ndags =10,
+                           sample_sizes = c(1000),
+                           algorithms = c('HC', 'EM', 'GES', 'PC', 'GS', 'FCI', 'MMHC', 'RSMAX2'),
+                           p = 20,
+                           EN = 2,
+                           sample_sizes = c(100, 500, 1000, 5000, 10000),
+                           prob_missing = 0.4
+                           )
+
+# Save the results to CSV
+write.csv(sim_data,
+          file = "test.csv",
+          row.names = FALSE)  
+
+# Report elapsed time in minutes
+end <- proc.time()
+diff <- end - start
+cat(diff["elapsed"]/60, "minutes\n")
+```
+
+
+
+```{r}
+sim_data
+```
+
+
+
+## Plots
+
+```{r}
+# # Snippet to remove GES and HC
+# t <- read.csv("data_10ndags_20p_3EN_03perc_04prob.csv")
+# tt <- t %>% filter(!algorithm %in% c("GES", "HC"))
+
+plot_results(sim_data,
+             filename = "test1.png",
+             x_axis = "sample_size"
+             )
+
+plot_time(sim_data,
+          filename = "test2.png"
+          )
+```
+
+
+
